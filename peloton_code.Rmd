@@ -1,0 +1,764 @@
+---
+title: "Peloton"
+author: "Jack Cao"
+date: "3/15/2023"
+output: html_document
+---
+
+# set up
+```{r}
+
+# packages needed
+library(tidyverse)   # for wrangling (e.g., dplyr) and visualization (ggplot2)
+library(lubridate)   # for working with dates and timestamps
+library(here)        # for setting the working directory since data is a .csv on local drive
+
+# set set working directory
+here::here()
+
+# load data
+workouts <- readr::read_csv("spa_cfx_tht_v2.csv")
+
+# view data
+utils::head(workouts)
+
+```
+
+# data cleaning
+```{r}
+
+workouts <- workouts %>% 
+  
+  # remove first column, which is the index from .csv
+  dplyr::select(-1) %>%
+  
+  # reformat some columns
+  dplyr::mutate(
+    
+    # workout_start_time as a timestamp
+    workout_start_time = lubridate::as_datetime(workout_start_time),
+    
+    # fitness_discipline and class_type as factors
+      # relatively few unique values compared to number of rows
+    fitness_discipline =  base::factor(x = fitness_discipline),
+    class_type = base::factor(x = class_type)
+  
+  )
+
+```
+
+# investigate NAs
+```{r}
+
+workouts %>% 
+  dplyr::filter(is.na(class_length))
+
+# rows with missing values are all cycling workouts; no class_type
+# perhaps free/unstructured rides?
+
+```
+
+
+# add additional columns: data wrangling
+```{r}
+
+# part 1: additional information about each workout
+workouts <- workouts %>%
+  
+  dplyr::mutate(
+    
+    # percent of the class completed; NA for free rides without a class length
+    pct_of_class_completed = workout_length_minutes / class_length,
+    
+    # whether class was finished (1) or not (0)
+    workout_finished = dplyr::case_when(
+      pct_of_class_completed >= 1 ~ 1,
+      TRUE ~ 0
+    ),
+    
+    # time the workout ended: convert workout length in minutes to rounded seconds and add to workout start time
+    workout_end_time = workout_start_time + lubridate::seconds(round(workout_length_minutes * 60, 0))
+  
+  )
+
+# part 2: within each user for each workout, information about the previous and next workout
+workouts <- workouts %>% 
+  
+  # reorder rows for previous workout information
+  dplyr::arrange(
+    user_id, workout_start_time
+  ) %>%
+  
+  # next fields are specific to each user
+  dplyr::group_by(user_id) %>%
+  
+  dplyr::mutate(
+    
+    # within each user, the discipline of the previous class
+    previous_fitness_discipline = dplyr::lag(fitness_discipline, n = 1),
+    
+    # within each user, the previous class type
+    previous_class_type = dplyr::lag(class_type, n = 1),
+    
+    # within each user, whether the previous class was finished
+    previous_workout_finished = dplyr::lag(workout_finished, n = 1),
+
+    # within each user, the start time of the previous workout
+    previous_workout_start_time = dplyr::lag(workout_start_time, n = 1),
+    
+    # within each user, the end time of the previous workout
+    previous_workout_end_time = dplyr::lag(workout_end_time, n = 1),
+    
+    
+    # within each user, the discipline of the next class
+    next_fitness_discipline = dplyr::lead(fitness_discipline, n = 1),
+    
+    # within each user, the next class type
+    next_class_type = dplyr::lead(class_type, n = 1),
+    
+    # within each user, whether the next class was finished
+    next_workout_finished = dplyr::lead(workout_finished, n = 1),
+
+    # within each user, the start time of the next workout
+    next_workout_start_time = dplyr::lead(workout_start_time, n = 1),
+    
+    # within each user, the end time of the next workout
+    next_workout_end_time = dplyr::lead(workout_end_time, n = 1)
+    
+  ) %>%
+  
+  # ungroup for performance improvement
+  dplyr::ungroup()
+
+# part 3: within each user, how many minutes passed between previous workout's end time and the current workout's start time
+workouts <- workouts %>%
+  dplyr::mutate(
+    
+    num_minutes_btw_prev_and_current_workout = 
+      lubridate::interval(previous_workout_end_time, workout_start_time) / lubridate::minutes(1),
+    
+    num_minutes_btw_current_and_next_workout = 
+      lubridate::interval(workout_end_time, next_workout_start_time) / lubridate::minutes(1),
+
+  )
+
+# part 4: flag if each workout occurred after a completed cycling workout
+workouts <- workouts %>%
+  
+  # whether workout occurred after a completed cycling workout (1) or not (0)
+  dplyr::mutate(
+    occurred_after_completed_cycling = dplyr::case_when(
+      previous_fitness_discipline == "Cycling" & previous_workout_finished == 1 ~ 1, 
+      TRUE ~ 0
+    )
+  )
+
+# part 5: additional time information
+workouts <- workouts %>%
+  
+  dplyr::mutate(
+    
+    # whether workout started on Mon, Tue, Wed, etc.
+    day_of_week = lubridate::wday(workout_start_time, label = TRUE),
+    
+    # whether workout started on a weekend (1) or not (0)
+    is_weekend = dplyr::case_when(
+      day_of_week == "Sat" | day_of_week == "Sun" ~ 1,
+      TRUE ~ 0
+    ),
+    
+    # hour of the workout started
+    hour_of_day = lubridate::hour(workout_start_time)
+  ) 
+
+```
+
+# investigate negative num_minutes_btw_prev_and_current_workout
+```{r}
+
+workouts %>% 
+  dplyr::count(
+    ifelse(num_minutes_btw_prev_and_current_workout < 0,
+           1,
+           0
+          )
+    )
+
+# users on multiple hardware devices?
+# single user id but multiple human users?
+
+```
+
+# Slide 4: Users began over 60% of their non-cycling workouts after finishing a cycling workout
+```{r}
+
+workouts %>%
+  
+  # non-cycling workouts only
+  dplyr::filter(
+    fitness_discipline != "Cycling"
+    ) %>%
+  
+  # only workouts with a positive minutes duration between previous and current
+  dplyr::filter(num_minutes_btw_prev_and_current_workout >= 0) %>%
+
+  # how many non-cycling workouts occurred after a completed cycling workout
+  dplyr::group_by(fitness_discipline, occurred_after_completed_cycling) %>%
+  dplyr::summarise(num_workouts_started = dplyr::n_distinct(workout_id)) %>% 
+  
+  # to make pretty for visualization
+    # normalize to 100% for each non-cycling discipline
+  dplyr::ungroup() %>%
+  dplyr::group_by(fitness_discipline) %>%
+  dplyr::mutate(total_workouts_started = base::sum(num_workouts_started), 
+                pct = num_workouts_started / total_workouts_started) %>%
+  
+    # make pretty labels
+  dplyr::mutate(
+    fitness_discipline = base::factor(
+      x = fitness_discipline, 
+      levels = rev(c("Stretching", "Strength", "Yoga", "Meditation", "Cardio")),
+      labels = rev(c("Stretching\n20,678 workouts started", "Strength\n30,465 workouts started",
+                     "Yoga\n2,117 workouts started", "Meditation\n390 workouts started",
+                     "Cardio\n155 workouts started"))
+    ), 
+    occurred_after_completed_cycling = base::factor(
+      x = occurred_after_completed_cycling, 
+      levels = c(0, 1), 
+      labels = c("No", "Yes")
+    )
+  ) %>%
+  
+  # visualize
+  ggplot(mapping = aes(x = fitness_discipline, y = pct, fill = occurred_after_completed_cycling)) + 
+  geom_col(width = 0.5) + 
+  geom_text(mapping = aes(label = scales::comma(num_workouts_started)), position = position_stack(vjust = 0.5)) + 
+  coord_flip() + 
+  scale_y_continuous(position = "right", labels = scales::percent_format(), breaks = seq(0, 1, 0.2)) + 
+  labs(x = NULL, y = NULL, 
+       fill = "Users started the\nnon-cycling workout\nafter they had\nfinished a cycling workout") + 
+  theme_bw() + 
+  theme(axis.text = element_text(color = "black"), 
+        panel.grid.minor = element_blank(), 
+        panel.border = element_blank()) + 
+  geom_hline(
+    yintercept = 32470 / 53805,    # weighted average
+    linetype = "dotted", 
+    lwd = 1.5
+  ) 
+  
+  
+
+```
+
+# Slide 5: Out of the non-cyclingw orkouts that began after a finished cycling workout, over 80% began within 10 minutes of the cycling workout's end.
+```{r}
+
+workouts %>%
+  
+  # non-cycling workouts...
+  dplyr::filter(fitness_discipline != "Cycling") %>%
+  
+  # ...that began after a completed a cycling class
+  dplyr::filter(occurred_after_completed_cycling == 1) %>%
+
+  # exclude workouts with negative time duration in between
+  dplyr::filter(num_minutes_btw_prev_and_current_workout >= 0) %>%
+  
+  # reorder to make visualization prettier
+  dplyr::mutate(
+    fitness_discipline = base::factor(x = fitness_discipline, 
+                                      levels = c("Stretching", "Strength", 
+                                                 "Meditation", "Yoga", "Cardio"))
+  ) %>% 
+  
+  # visualize
+    # one line for each non-cycling discipline
+  ggplot(mapping = aes(x = num_minutes_btw_prev_and_current_workout, color = fitness_discipline)) + 
+  stat_ecdf() + 
+    # add line for overall non-cycling
+  stat_ecdf(
+    data = workouts %>% 
+      dplyr::filter(fitness_discipline != "Cycling") %>% 
+      dplyr::filter(occurred_after_completed_cycling == 1) %>% 
+      dplyr::filter(num_minutes_btw_prev_and_current_workout >= 0),
+    color = "black", lwd = 2
+  ) + 
+  scale_y_continuous(breaks = seq(0, 1, 0.1), labels = scales::percent_format()) + 
+  scale_x_continuous(breaks = seq(0, 20, 2)) + 
+  coord_cartesian(xlim = c(0, 20), ylim = c(0, 1)) + 
+  labs(x = "\nNumber of minutes between\nend of completed cycling workout\nand start of non-cycling workout", y = NULL, 
+       color = "Non-cycling\nworkout") +
+  theme_bw() + 
+  theme(axis.text = element_text(color = "black"), 
+        panel.grid.minor = element_blank(), 
+        panel.border = element_blank()) 
+
+```
+
+# Slide 7: Out of the non-cycling workouts that users started within 10 minutes of finishing a cycling workout, more than 70% were finished by users.
+```{r}
+
+workouts %>%
+  
+  # non-cycling workouts...
+  dplyr::filter(fitness_discipline != "Cycling") %>%
+  
+  # ...that began after a completed a cycling class
+  dplyr::filter(occurred_after_completed_cycling == 1) %>%
+
+  # exclude workouts with negative time duration in between
+  dplyr::filter(num_minutes_btw_prev_and_current_workout >= 0) %>%
+  
+  # within 10 min
+  dplyr::filter(num_minutes_btw_prev_and_current_workout <= 10) %>%
+  
+  # for each non-cycling workout, completion rate
+  dplyr::group_by(class_type) %>%
+  dplyr::summarise(num_workouts_finished = base::sum(workout_finished), 
+                   total_workouts = dplyr::n_distinct(workout_id), 
+                   pct = num_workouts_finished / total_workouts) %>%
+  
+  # make pretty for visualizing
+  dplyr::ungroup() %>%
+  
+  dplyr::mutate(
+    x_axis_label = base::paste0(
+      class_type, ": ", total_workouts, " workouts"
+    )
+  ) %>%
+  
+  ggplot(mapping = aes(x = reorder(x_axis_label, pct), y = pct, fill = pct)) + 
+  geom_col(width = 0.5) + 
+  coord_flip() + 
+  scale_fill_viridis_c() + 
+  geom_hline(yintercept = 18765 / 26172, linetype = "dashed") + 
+  scale_y_continuous(
+    breaks = seq(0, 1, 0.1), labels = scales::percent_format(), 
+    position = "right"
+  ) + 
+  labs(x = "Non-cycling workouts\nstarted within 10 min\nof finished cycling workout\n", 
+       y = "Percent finished\n") + 
+  theme_bw() + 
+  theme(legend.position = "none", 
+        axis.text = element_text(color = "black"), 
+        panel.grid = element_blank(), 
+        panel.border = element_blank())
+  
+
+```
+
+
+# Slide 8: Users show consistent preferences for the type of non-cycling workout regardless of what cycling workout they completed.
+```{r}
+
+workouts %>%
+  
+  # non-cycling workouts...
+  dplyr::filter(fitness_discipline != "Cycling") %>%
+  
+  # ...that began after a completed a cycling class
+  dplyr::filter(occurred_after_completed_cycling == 1) %>%
+
+  # exclude workouts with negative time duration in between
+  dplyr::filter(num_minutes_btw_prev_and_current_workout >= 0) %>%
+  
+  # within 10 min
+  dplyr::filter(num_minutes_btw_prev_and_current_workout <= 10) %>% 
+  
+  # 
+  dplyr::group_by(previous_class_type, class_type) %>%
+  dplyr::summarise(num_workouts_started = dplyr::n_distinct(workout_id)) %>%
+  
+
+  
+  # normalize
+  dplyr::ungroup() %>%
+  dplyr::group_by(previous_class_type) %>%
+  dplyr::mutate(
+    total_cycling = base::sum(num_workouts_started),
+    pct = num_workouts_started / total_cycling
+  ) %>%
+
+  # visualize
+  ggplot(mapping = aes(x = previous_class_type, y = class_type, fill = pct)) + 
+  geom_tile(color = "white", size = 0.5) + 
+  scale_fill_viridis_c(labels = scales::percent_format()) + 
+  labs(x = "Previous completed cycling class type", 
+       y = "Next started non-cyclcing workout", 
+       fill = "Within each\ncycling class type (column),\npercent of\nnon-cycling workouts\nthat began within 10 minutes") + 
+  theme_bw() + 
+  theme(
+    axis.text = element_text(color = "black"),
+    panel.grid = element_blank(), 
+    #panel.border = element_blank(),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)
+  )
+
+```
+
+# Slide 10: Users tended to supplement their cycling workouts with strength and stretching workouts in the afternoons and evenings. Other non-cycling workouts were less common throughout the week.
+
+```{r}
+
+workouts %>%
+  
+  # non-cycling workouts...
+  dplyr::filter(fitness_discipline != "Cycling") %>%
+  
+  # ...that began after a completed a cycling class
+  dplyr::filter(occurred_after_completed_cycling == 1) %>%
+
+  # exclude workouts with negative time duration in between
+  dplyr::filter(num_minutes_btw_prev_and_current_workout >= 0) %>%
+  
+  # started within 10 minutes
+  dplyr::filter(num_minutes_btw_prev_and_current_workout < 10) %>%
+
+  # create new column for date_of for visual aesthetics
+  dplyr::mutate(
+    date_of = lubridate::date(workout_start_time), 
+    date_of_label = paste0(date_of, ": ", day_of_week)
+  ) %>% 
+  
+  # number started for these cuts
+  dplyr::group_by(
+    date_of_label, hour_of_day, fitness_discipline,
+  ) %>%
+  dplyr::summarise(
+    num_workouts_started = dplyr::n_distinct(workout_id)
+  ) %>%
+  
+  ggplot(
+    mapping = aes(x = hour_of_day, y = num_workouts_started, color = fitness_discipline)
+  ) + 
+  facet_wrap(~date_of_label, nrow = 2) + 
+  geom_line(lwd = 1.5, alpha = 0.5) + 
+  labs(x = "Hour of the day", 
+       title = "Number of non-cycling workouts\nstarted within 10 minutes of a finished cycling workout", subtitle = "On each day (panels) and cut by discipline (colors)", 
+       y = NULL, fill = NULL, color = NULL) + 
+  coord_cartesian(xlim = c(0, 24)) + 
+  scale_x_continuous(breaks = seq(0, 24, 3)) + 
+  theme_bw() + 
+  theme(
+    axis.text = element_text(color = "black"), 
+    panel.grid.minor = element_blank()
+  )
+
+
+
+
+
+
+```
+
+
+# Slide 11: After a completed cycling workout, there are upticks in non-cycling workouts at 12-15 hours and 24 hours.
+```{r}
+
+workouts %>%
+  
+  # non-cycling workouts...
+  dplyr::filter(fitness_discipline != "Cycling") %>%
+  
+  # ...that began after a completed a cycling class
+  dplyr::filter(occurred_after_completed_cycling == 1) %>%
+
+  # exclude workouts with negative time duration in between
+  dplyr::filter(num_minutes_btw_prev_and_current_workout >= 0) %>%
+  
+  # reorder to make visualization prettier
+  dplyr::mutate(
+    fitness_discipline = base::factor(x = fitness_discipline, 
+                                      levels = c("Stretching", "Strength", 
+                                                 "Meditation", "Yoga", "Cardio"))
+  ) %>% 
+  
+  # visualize
+    # one line for each non-cycling discipline
+  ggplot(mapping = aes(x = num_minutes_btw_prev_and_current_workout / 60, color = fitness_discipline)) + 
+  stat_ecdf() + 
+    # add line for overall non-cycling
+  stat_ecdf(
+    data = workouts %>% 
+      dplyr::filter(fitness_discipline != "Cycling") %>% 
+      dplyr::filter(occurred_after_completed_cycling == 1) %>% 
+      dplyr::filter(num_minutes_btw_prev_and_current_workout >= 0),
+    color = "black", lwd = 2
+  ) + 
+  scale_y_continuous(breaks = seq(0, 1, 0.1), labels = scales::percent_format()) + 
+  scale_x_continuous(breaks = seq(0, 36, 3)) + 
+  coord_cartesian(xlim = c(0, 36), ylim = c(0, 1)) + 
+  labs(x = "\nNumber of hours between\nend of completed cycling workout\nand start of non-cycling workout", y = NULL, 
+       color = "Non-cycling\nworkout") +
+  theme_bw() + 
+  theme(axis.text = element_text(color = "black"), 
+        panel.grid.minor = element_blank(), 
+        panel.border = element_blank()) 
+
+```
+# Slide 13: As an adoption target, we should consider a 6% uplift in completed cycling workouts that are followed by a non-cycling workout within 10 minutes
+ 
+```{r}
+
+# 476,425 total workouts
+nrow(workouts)
+
+# 415,008 cycling workouts
+workouts %>%
+  dplyr::count(fitness_discipline)
+
+
+  # calculate: 26,148 cycling workouts that are followed by non-cycling workout within 10 minutes
+workouts %>%
+  dplyr::filter(
+    fitness_discipline == "Cycling"
+      & workout_finished == 1
+      & next_fitness_discipline != "Cycling"
+      & num_minutes_btw_current_and_next_workout > 0 
+      & num_minutes_btw_current_and_next_workout <= 10
+    ) %>%
+  nrow()
+
+  # pull forward in time: 1,683: adoption target raw count
+workouts %>%
+  dplyr::filter(
+    fitness_discipline == "Cycling"
+      & workout_finished == 1
+      & next_fitness_discipline != "Cycling"
+      & num_minutes_btw_current_and_next_workout > 10
+      & num_minutes_btw_current_and_next_workout <= 30
+    ) %>%
+  nrow()
+
+  # 4,615: out of scope for queuing feature
+workouts %>%
+  dplyr::filter(
+    fitness_discipline == "Cycling"
+      & workout_finished == 1
+      & next_fitness_discipline != "Cycling"
+      & num_minutes_btw_current_and_next_workout > 30
+    ) %>%
+  nrow()
+
+
+workouts %>%
+  dplyr::filter(
+    fitness_discipline == "Cycling"
+      & workout_finished == 1
+      & next_fitness_discipline != "Cycling"
+      & num_minutes_btw_current_and_next_workout > 30
+    ) %>%
+  dplyr::pull(num_minutes_btw_current_and_next_workout) %>%
+  median()
+
+1362.267 / 60  # 22.7 hours --> 1 day later
+
+```
+
+# Slide 13: As an adoption target, we should consider a 6% uplift in completed cycling workouts that are followed by a non-cycling workout within 10 minutes
+```{r}
+
+tibble::tibble(
+  time_to_start = c("< 10 min", "10 - 30 min", "> 30 min"), 
+  num_workouts = c(26148, 1683, 4615)
+) %>%
+  dplyr::mutate(time_to_start = base::factor(time_to_start, 
+                                             levels = c("< 10 min", "10 - 30 min", "> 30 min"))) %>% 
+  ggplot(mapping = aes(x = time_to_start, y = num_workouts)) + 
+  geom_col(width = 0.33) + 
+  geom_text(mapping = aes(label = scales::comma(num_workouts)), 
+            vjust = -1) + 
+  labs(x = "\nTime between finishing the cycling workout and\nstarting the next non-cycling workout", 
+       y = NULL, 
+       title = "Number of finished cycling workouts that were followed by a non-cycling workout", 
+       subtitle = "By the same user") + 
+  coord_cartesian(ylim = c(0, 30000)) + 
+  scale_y_continuous(labels = scales::comma_format(), 
+                     breaks = seq(0, 30000, 5000)) +
+  theme_bw() + 
+  theme(axis.text = element_text(color = "black"), 
+        panel.grid = element_blank())
+  
+
+```
+
+# Slide 15:
+```{r}
+
+workouts %>%
+  
+  # non-cycling workouts...
+  dplyr::filter(fitness_discipline != "Cycling") %>%
+  
+  # ...that began after a completed a cycling class
+  dplyr::filter(occurred_after_completed_cycling == 1) %>%
+
+  # exclude workouts with negative time duration in between
+  dplyr::filter(num_minutes_btw_prev_and_current_workout >= 0) %>%
+  
+  # where next fitness class was cycling
+  dplyr::filter(
+    next_fitness_discipline == "Cycling"
+  ) %>%
+  
+  dplyr::pull(num_minutes_btw_current_and_next_workout) %>%
+  stats::median()
+
+# 1 day, 23.9 hours
+1432.583 / 60
+
+```
+
+
+# Slide 16: no code, just conceptual
+
+# on how many days was each user active?
+```{r}
+
+# across all users, avg user was active on 2.35 days out of 7
+workouts %>%
+  dplyr::group_by(user_id) %>%
+  dplyr::summarise(
+    num_days_active = dplyr::n_distinct(lubridate::date(workout_start_time))
+  ) %>%
+  dplyr::pull(num_days_active) %>%
+  mean()
+
+
+
+```
+
+# on how many days were the cycling-non cycling users active?
+```{r}
+
+# identify those users
+users_back_to_back <- workouts %>%
+  dplyr::filter(
+    fitness_discipline == "Cycling"
+      & workout_finished == 1
+      & next_fitness_discipline != "Cycling"
+      & num_minutes_btw_current_and_next_workout > 0
+      & num_minutes_btw_current_and_next_workout <= 10
+    ) %>%
+  dplyr::pull(user_id) %>%
+  unique()
+
+# how many days were they active?
+workouts %>%
+  dplyr::filter(
+    user_id %in% users_back_to_back
+  ) %>%
+  dplyr::group_by(user_id) %>%
+  dplyr::summarise(
+    num_days_active = dplyr::n_distinct(lubridate::date(workout_start_time))
+  ) %>%
+  dplyr::pull(num_days_active) %>%
+  mean()
+
+# 3.40 days
+
+```
+
+
+# Appendix
+
+# exploratory analysis: understand relationship between fitness_discipline and class_type
+```{r}
+
+workouts %>%
+  dplyr::group_by(fitness_discipline, class_type) %>%
+  dplyr::summarise(num_workouts = dplyr::n_distinct(workout_id)) %>% 
+  ggplot(mapping = aes(x = class_type, y = num_workouts)) + 
+  facet_wrap(~fitness_discipline, scales = "free", nrow = 3) + 
+  geom_col() + 
+  coord_flip()
+
+# fitness_discipline is the umbrella
+# class_type are sub-categories within fitness_discipline
+
+```
+
+# exploratory analysis: number of workouts finsihed by class_type and fitness_discipline
+same as above except fill colors to indicate how many finished vs. not
+```{r}
+
+workouts %>%
+  dplyr::group_by(fitness_discipline, class_type, workout_finished) %>%
+  dplyr::summarise(num_workouts = dplyr::n_distinct(workout_id)) %>%
+  ggplot(mapping = aes(x = class_type, y = num_workouts, fill = base::as.factor(workout_finished))) + 
+  facet_wrap(~fitness_discipline, scales = "free", nrow = 3) + 
+  geom_col() + 
+  coord_flip() + 
+  theme(
+    legend.position = "top"
+  )
+
+```
+# exploratory analysis: distribution of number of workouts started by day
+```{r}
+
+workouts %>%
+  dplyr::mutate(
+    workout_start_date = lubridate::as_date(workout_start_time)
+  ) %>% 
+  dplyr::group_by(workout_start_date, day_of_week) %>%
+  dplyr::summarise(num_workouts_started = n_distinct(workout_id)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    day = base::paste0(workout_start_date, ", ", day_of_week), 
+    pct_of_workouts_started = num_workouts_started / base::sum(num_workouts_started)
+  ) %>%
+  ggplot(mapping = aes(x = day, y = pct_of_workouts_started)) + 
+  geom_col() + 
+  coord_flip() + 
+  scale_x_discrete(limits = rev) + 
+  scale_y_continuous(labels = scales::percent_format())
+
+# Sun is least busy day. Picks up on Mon and Tue. Decrease from Wed-Fri and picks up again on Sat.
+
+```
+
+# exploratory analysis: on each day, at what hour do workouts begin?
+```{r}
+
+workouts %>%
+  dplyr::mutate(
+    workout_start_date = lubridate::as_date(workout_start_time), 
+    day = base::paste0(workout_start_date, ", ", day_of_week)
+  ) %>%
+  dplyr::group_by(day, hour_of_day) %>%
+  dplyr::summarise(num_workouts_started = dplyr::n_distinct(workout_id)) %>%
+  ggplot(mapping = aes(x = hour_of_day, y = num_workouts_started)) + 
+  facet_wrap(~day) + 
+  geom_col()
+
+```
+
+# exploratory analysis: distribution of number of workouts started per user
+```{r}
+
+# right skewed distribution: >90% of users have 6 or fewer workouts during the week
+
+workouts %>% 
+  dplyr::group_by(user_id) %>% 
+  dplyr::summarise(num_workouts_started = dplyr::n_distinct(workout_id)) %>% 
+  dplyr::group_by(num_workouts_started) %>%
+  dplyr::summarise(num_users = dplyr::n_distinct(user_id)) %>%
+  dplyr::arrange(num_workouts_started) %>%
+  dplyr::mutate(
+    cum_pct_of_users = base::cumsum(num_users) / base::sum(num_users)
+  ) %>% 
+  ggplot(mapping = aes(x = num_workouts_started, y = cum_pct_of_users)) + 
+  geom_point() + 
+  geom_line() + 
+  coord_cartesian(ylim = c(0, 1)) + 
+  scale_y_continuous(labels = scales::percent_format(), 
+                     breaks = seq(0, 1, 0.2))
+
+# how to improve chart
+# label 1 thru 6 and outliers above and below 400
+# latter are perhaps single-user, multiple people
+
+```
+
